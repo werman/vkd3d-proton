@@ -449,6 +449,7 @@ static const struct vkd3d_shader_quirk_info f1_2020_quirks = {
     NULL, 0, VKD3D_SHADER_QUIRK_FORCE_TGSM_BARRIERS,
 };
 
+/* Checks if the end of the application's name matches. */
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* Psychonauts 2 (607080) */
     { "Psychonauts2-Win64-Shipping.exe", &psychonauts2_quirks },
@@ -467,7 +468,7 @@ static void vkd3d_instance_apply_application_workarounds(void)
 
     for (i = 0; i < ARRAY_SIZE(application_override); i++)
     {
-        if (application_override[i].name && !strcmp(app, application_override[i].name))
+        if (application_override[i].name && vkd3d_string_ends_with(app, application_override[i].name))
         {
             vkd3d_config_flags |= application_override[i].global_flags_add;
             vkd3d_config_flags &= ~application_override[i].global_flags_remove;
@@ -479,7 +480,7 @@ static void vkd3d_instance_apply_application_workarounds(void)
 
     for (i = 0; i < ARRAY_SIZE(application_shader_quirks); i++)
     {
-        if (application_shader_quirks[i].name && !strcmp(app, application_shader_quirks[i].name))
+        if (application_shader_quirks[i].name && vkd3d_string_ends_with(app, application_shader_quirks[i].name))
         {
             vkd3d_shader_quirk_info = application_shader_quirks[i].info;
             INFO("Detected game %s, adding shader quirks for specific shaders.\n", app);
