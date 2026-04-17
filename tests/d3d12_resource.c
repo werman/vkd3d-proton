@@ -5009,6 +5009,486 @@ void test_large_texel_buffer_view(void)
     destroy_test_context(&context);
 }
 
+
+void test_large_byte_address_buffer(void)
+{
+    ID3D12DescriptorHeap *descriptor_heap, *descriptor_cpu_heap;
+    ID3D12Resource *data_buffer, *feedback_buffer;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc;
+    ID3D12GraphicsCommandList2 *command_list2;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    D3D12_FEATURE_DATA_SHADER_MODEL shader_model;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4;
+    ID3D12PipelineState *srv_pso, *uav_pso, *atomic_pso;
+    ID3D12PipelineState *srv_pso_16, *uav_pso_16;
+    D3D12_DESCRIPTOR_RANGE rs_desc_ranges[2];
+    D3D12_HEAP_PROPERTIES heap_properties;
+    D3D12_ROOT_SIGNATURE_DESC rs_desc;
+    D3D12_RESOURCE_DESC resource_desc;
+    D3D12_ROOT_PARAMETER rs_args[2];
+    struct resource_readback rb;
+    struct test_context context;
+    bool supports_16bit;
+    UINT clear_color[4];
+    unsigned int i, j;
+    HRESULT hr;
+
+#include "shaders/resource/headers/cs_large_bab_load.h"
+#include "shaders/resource/headers/cs_large_bab_store.h"
+#include "shaders/resource/headers/cs_large_bab_atomics.h"
+#include "shaders/resource/headers/cs_large_bab_load_16.h"
+#include "shaders/resource/headers/cs_large_bab_store_16.h"
+
+    static const struct
+    {
+        uint32_t view_elements;
+        uint32_t test_data;
+    }
+    tests[] =
+    {
+        { 64, 0xf000ba22 },              /* 256 bytes - sanity check */
+        { 1u << 20, 0xcafef00d },         /* 4 MB */
+        // { 2048u << 18u, 0xdeadbeef },     /* 2 GB (full buffer) */
+    };
+
+    const uint32_t buffer_size = 2048u << 20u;
+
+    struct
+    {
+        uint32_t byte_offset;
+        uint32_t data;
+        uint32_t feedback_offset;
+    } shader_args;
+
+    const struct
+    {
+        uint32_t dimensions;
+        uint32_t load1;
+        uint32_t load2_x;
+        uint32_t load2_y;
+        uint32_t load3_x;
+        uint32_t load3_y;
+        uint32_t load3_z;
+        uint32_t load4_x;
+        uint32_t load4_y;
+        uint32_t load4_z;
+        uint32_t load4_w;
+    } *feedback;
+
+    if (!init_compute_test_context(&context))
+        return;
+
+    if (FAILED(ID3D12GraphicsCommandList_QueryInterface(context.list, &IID_ID3D12GraphicsCommandList2, (void**)&command_list2)))
+    {
+        skip("ID3D12GraphicsCommandList2 not supported by implementation.\n");
+        destroy_test_context(&context);
+        return;
+    }
+
+    shader_model.HighestShaderModel = D3D_SHADER_MODEL_6_2;
+    hr = ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_SHADER_MODEL, &shader_model, sizeof(shader_model));
+
+    memset(&options4, 0, sizeof(options4));
+    if (SUCCEEDED(hr) && shader_model.HighestShaderModel >= D3D_SHADER_MODEL_6_2)
+        hr = ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_D3D12_OPTIONS4, &options4, sizeof(options4));
+    else
+        hr = E_FAIL;
+
+    supports_16bit = SUCCEEDED(hr) && options4.Native16BitShaderOpsSupported;
+
+    memset(&heap_properties, 0, sizeof(heap_properties));
+    heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    memset(&resource_desc, 0, sizeof(resource_desc));
+    resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resource_desc.Width = buffer_size;
+    resource_desc.Height = 1;
+    resource_desc.DepthOrArraySize = 1;
+    resource_desc.MipLevels = 1;
+    resource_desc.SampleDesc.Count = 1;
+    resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    hr = ID3D12Device_CreateCommittedResource(context.device, &heap_properties, D3D12_HEAP_FLAG_NONE,
+            &resource_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void**)&data_buffer);
+
+    if (FAILED(hr))
+    {
+        skip("Failed to create data buffer, hr %#x.\n", hr);
+        ID3D12GraphicsCommandList2_Release(command_list2);
+        destroy_test_context(&context);
+        return;
+    }
+
+    resource_desc.Width = sizeof(*feedback) * 3;
+
+    hr = ID3D12Device_CreateCommittedResource(context.device, &heap_properties, D3D12_HEAP_FLAG_NONE,
+            &resource_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void**)&feedback_buffer);
+    ok(hr == S_OK, "Failed to create feedback buffer, hr %#x.\n", hr);
+
+    descriptor_heap = create_gpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4);
+    descriptor_cpu_heap = create_cpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+
+    /* Feedback UAV (structured buffer, slot 2) */
+    memset(&uav_desc, 0, sizeof(uav_desc));
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav_desc.Buffer.StructureByteStride = sizeof(*feedback);
+    uav_desc.Buffer.NumElements = 3;
+
+    ID3D12Device_CreateUnorderedAccessView(context.device, feedback_buffer, NULL,
+            &uav_desc, get_cpu_descriptor_handle(&context, descriptor_heap, 2));
+
+    /* Root signature */
+    memset(&rs_desc, 0, sizeof(rs_desc));
+    rs_desc.NumParameters = ARRAY_SIZE(rs_args);
+    rs_desc.pParameters = rs_args;
+
+    memset(rs_args, 0, sizeof(rs_args));
+    rs_args[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rs_args[0].DescriptorTable.NumDescriptorRanges = ARRAY_SIZE(rs_desc_ranges);
+    rs_args[0].DescriptorTable.pDescriptorRanges = rs_desc_ranges;
+    rs_args[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    rs_args[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rs_args[1].Constants.Num32BitValues = sizeof(shader_args) / sizeof(uint32_t);
+    rs_args[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    memset(rs_desc_ranges, 0, sizeof(rs_desc_ranges));
+    rs_desc_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    rs_desc_ranges[0].OffsetInDescriptorsFromTableStart = 0;
+    rs_desc_ranges[0].NumDescriptors = 1;
+
+    rs_desc_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    rs_desc_ranges[1].OffsetInDescriptorsFromTableStart = 1;
+    rs_desc_ranges[1].NumDescriptors = 2;
+
+    hr = create_root_signature(context.device, &rs_desc, &context.root_signature);
+    ok(hr == S_OK, "Failed to create root signature, hr %#x.\n", hr);
+
+    srv_pso = create_compute_pipeline_state(context.device, context.root_signature, cs_large_bab_load_dxbc);
+    uav_pso = create_compute_pipeline_state(context.device, context.root_signature, cs_large_bab_store_dxbc);
+    atomic_pso = create_compute_pipeline_state(context.device, context.root_signature, cs_large_bab_atomics_dxbc);
+
+    if (supports_16bit)
+    {
+        srv_pso_16 = create_compute_pipeline_state(context.device, context.root_signature, cs_large_bab_load_16_dxil);
+        uav_pso_16 = create_compute_pipeline_state(context.device, context.root_signature, cs_large_bab_store_16_dxil);
+    }
+    else
+    {
+        srv_pso_16 = NULL;
+        uav_pso_16 = NULL;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        const uint32_t first_element = 0;
+        const uint32_t num_elements = tests[i].view_elements - first_element;
+        const uint32_t view_byte_size = num_elements * sizeof(uint32_t);
+        const uint32_t test_byte_offset = view_byte_size - 16u;
+        const bool is_large = tests[i].view_elements == (2048u << 18u);
+
+        vkd3d_test_set_context("Test %u (view %#x bytes)", i, view_byte_size);
+
+        /* Raw SRV (slot 0) */
+        memset(&srv_desc, 0, sizeof(srv_desc));
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.Buffer.FirstElement = first_element;
+        srv_desc.Buffer.NumElements = num_elements;
+        srv_desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+
+        ID3D12Device_CreateShaderResourceView(context.device, data_buffer,
+                &srv_desc, get_cpu_descriptor_handle(&context, descriptor_heap, 0));
+
+        /* Raw UAV (slot 1) */
+        memset(&uav_desc, 0, sizeof(uav_desc));
+        uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uav_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        uav_desc.Buffer.FirstElement = first_element;
+        uav_desc.Buffer.NumElements = num_elements;
+        uav_desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+
+        ID3D12Device_CreateUnorderedAccessView(context.device, data_buffer, NULL,
+                &uav_desc, get_cpu_descriptor_handle(&context, descriptor_heap, 1));
+
+        /* Typed UAV for ClearUnorderedAccessViewUint (slot 3 GPU, slot 0 CPU) */
+        memset(&uav_desc, 0, sizeof(uav_desc));
+        uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uav_desc.Format = DXGI_FORMAT_R32_UINT;
+        uav_desc.Buffer.FirstElement = first_element + num_elements - 4;
+        uav_desc.Buffer.NumElements = 4;
+
+        ID3D12Device_CreateUnorderedAccessView(context.device, data_buffer, NULL,
+                &uav_desc, get_cpu_descriptor_handle(&context, descriptor_heap, 3));
+        ID3D12Device_CreateUnorderedAccessView(context.device, data_buffer, NULL,
+                &uav_desc, get_cpu_descriptor_handle(&context, descriptor_cpu_heap, 0));
+
+        /* === 32-bit Load/Store === */
+        memset(clear_color, 0, sizeof(clear_color));
+        clear_color[0] = tests[i].test_data;
+
+        ID3D12GraphicsCommandList2_ClearUnorderedAccessViewUint(command_list2,
+                get_gpu_descriptor_handle(&context, descriptor_heap, 3),
+                get_cpu_descriptor_handle(&context, descriptor_cpu_heap, 0),
+                data_buffer, clear_color, 0, NULL);
+
+        ID3D12GraphicsCommandList_Close(context.list);
+        exec_command_list(context.queue, context.list);
+        wait_queue_idle(context.device, context.queue);
+        reset_command_list(context.list, context.allocator);
+
+        shader_args.byte_offset = test_byte_offset;
+        shader_args.data = tests[i].test_data;
+        shader_args.feedback_offset = 0;
+
+        /* SRV load */
+        transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, 1, &descriptor_heap);
+        ID3D12GraphicsCommandList_SetComputeRootSignature(context.list, context.root_signature);
+        ID3D12GraphicsCommandList_SetPipelineState(context.list, srv_pso);
+        ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(context.list, 0, get_gpu_descriptor_handle(&context, descriptor_heap, 0));
+        ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
+        ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+
+        /* UAV load + store */
+        transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        shader_args.feedback_offset = 1;
+
+        ID3D12GraphicsCommandList_SetPipelineState(context.list, uav_pso);
+        ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
+        ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+
+        /* SRV load after store */
+        transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        shader_args.feedback_offset = 2;
+
+        ID3D12GraphicsCommandList_SetPipelineState(context.list, srv_pso);
+        ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
+        ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+
+        /* Readback */
+        transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition_resource_state(context.list, feedback_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+        get_buffer_readback_with_command_list(feedback_buffer, DXGI_FORMAT_UNKNOWN, &rb, context.queue, context.list);
+
+        feedback = rb.data;
+
+        for (j = 0; j < 3; j++)
+        {
+            uint32_t expected = tests[i].test_data;
+
+            if (j == 2)
+                expected += 1u;
+
+            todo_if(is_large)
+            ok(feedback[j].dimensions == view_byte_size, "Got dimensions %#x, expected %#x at %u.\n",
+                    feedback[j].dimensions, view_byte_size, j);
+            ok(feedback[j].load1 == expected, "Got load1 %#x, expected %#x at %u.\n",
+                    feedback[j].load1, expected, j);
+            ok(feedback[j].load2_x == expected, "Got load2.x %#x, expected %#x at %u.\n",
+                    feedback[j].load2_x, expected, j);
+            ok(feedback[j].load2_y == expected, "Got load2.y %#x, expected %#x at %u.\n",
+                    feedback[j].load2_y, expected, j);
+            ok(feedback[j].load3_x == expected, "Got load3.x %#x, expected %#x at %u.\n",
+                    feedback[j].load3_x, expected, j);
+            ok(feedback[j].load3_y == expected, "Got load3.y %#x, expected %#x at %u.\n",
+                    feedback[j].load3_y, expected, j);
+            ok(feedback[j].load3_z == expected, "Got load3.z %#x, expected %#x at %u.\n",
+                    feedback[j].load3_z, expected, j);
+            ok(feedback[j].load4_x == expected, "Got load4.x %#x, expected %#x at %u.\n",
+                    feedback[j].load4_x, expected, j);
+            ok(feedback[j].load4_y == expected, "Got load4.y %#x, expected %#x at %u.\n",
+                    feedback[j].load4_y, expected, j);
+            ok(feedback[j].load4_z == expected, "Got load4.z %#x, expected %#x at %u.\n",
+                    feedback[j].load4_z, expected, j);
+            ok(feedback[j].load4_w == expected, "Got load4.w %#x, expected %#x at %u.\n",
+                    feedback[j].load4_w, expected, j);
+        }
+
+        release_resource_readback(&rb);
+        reset_command_list(context.list, context.allocator);
+
+        /* === Atomics === */
+        transition_resource_state(context.list, feedback_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        memset(clear_color, 0, sizeof(clear_color));
+        clear_color[0] = tests[i].test_data;
+
+        ID3D12GraphicsCommandList2_ClearUnorderedAccessViewUint(command_list2,
+                get_gpu_descriptor_handle(&context, descriptor_heap, 3),
+                get_cpu_descriptor_handle(&context, descriptor_cpu_heap, 0),
+                data_buffer, clear_color, 0, NULL);
+
+        ID3D12GraphicsCommandList_Close(context.list);
+        exec_command_list(context.queue, context.list);
+        wait_queue_idle(context.device, context.queue);
+        reset_command_list(context.list, context.allocator);
+
+        shader_args.byte_offset = test_byte_offset;
+        shader_args.data = tests[i].test_data;
+        shader_args.feedback_offset = 0;
+
+        ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, 1, &descriptor_heap);
+        ID3D12GraphicsCommandList_SetComputeRootSignature(context.list, context.root_signature);
+        ID3D12GraphicsCommandList_SetPipelineState(context.list, atomic_pso);
+        ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(context.list, 0, get_gpu_descriptor_handle(&context, descriptor_heap, 0));
+        ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
+        ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+
+        transition_resource_state(context.list, feedback_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+        get_buffer_readback_with_command_list(feedback_buffer, DXGI_FORMAT_UNKNOWN, &rb, context.queue, context.list);
+
+        feedback = rb.data;
+
+        todo_if(is_large)
+        ok(feedback[0].dimensions == view_byte_size, "Got dimensions %#x, expected %#x.\n",
+                feedback[0].dimensions, view_byte_size);
+        ok(feedback[0].load1 == tests[i].test_data, "Got InterlockedAdd original %#x, expected %#x.\n",
+                feedback[0].load1, tests[i].test_data);
+        ok(feedback[0].load2_x == tests[i].test_data + 1, "Got value after InterlockedAdd %#x, expected %#x.\n",
+                feedback[0].load2_x, tests[i].test_data + 1);
+
+        release_resource_readback(&rb);
+        reset_command_list(context.list, context.allocator);
+
+        /* === 16-bit Load/Store === */
+        if (supports_16bit)
+        {
+            const uint32_t test_data_16 = 0x00220011;
+            const uint16_t expected_lo = 0x0011;
+            const uint16_t expected_hi = 0x0022;
+
+            transition_resource_state(context.list, feedback_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            memset(clear_color, 0, sizeof(clear_color));
+            clear_color[0] = test_data_16;
+
+            ID3D12GraphicsCommandList2_ClearUnorderedAccessViewUint(command_list2,
+                    get_gpu_descriptor_handle(&context, descriptor_heap, 3),
+                    get_cpu_descriptor_handle(&context, descriptor_cpu_heap, 0),
+                    data_buffer, clear_color, 0, NULL);
+
+            ID3D12GraphicsCommandList_Close(context.list);
+            exec_command_list(context.queue, context.list);
+            wait_queue_idle(context.device, context.queue);
+            reset_command_list(context.list, context.allocator);
+
+            shader_args.byte_offset = test_byte_offset;
+            shader_args.data = test_data_16;
+            shader_args.feedback_offset = 0;
+
+            /* SRV 16-bit load */
+            transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, 1, &descriptor_heap);
+            ID3D12GraphicsCommandList_SetComputeRootSignature(context.list, context.root_signature);
+            ID3D12GraphicsCommandList_SetPipelineState(context.list, srv_pso_16);
+            ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(context.list, 0, get_gpu_descriptor_handle(&context, descriptor_heap, 0));
+            ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
+            ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+
+            /* UAV 16-bit load + store */
+            transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            shader_args.feedback_offset = 1;
+
+            ID3D12GraphicsCommandList_SetPipelineState(context.list, uav_pso_16);
+            ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
+            ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+
+            /* SRV 16-bit load after store */
+            transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            shader_args.feedback_offset = 2;
+
+            ID3D12GraphicsCommandList_SetPipelineState(context.list, srv_pso_16);
+            ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
+            ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+
+            /* Readback */
+            transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            transition_resource_state(context.list, feedback_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+            get_buffer_readback_with_command_list(feedback_buffer, DXGI_FORMAT_UNKNOWN, &rb, context.queue, context.list);
+
+            feedback = rb.data;
+
+            for (j = 0; j < 3; j++)
+            {
+                uint16_t exp_lo = expected_lo;
+                uint16_t exp_hi = expected_hi;
+
+                if (j == 2)
+                {
+                    exp_lo += 1u;
+                    exp_hi += 1u;
+                }
+
+                todo_if(is_large)
+                ok(feedback[j].dimensions == view_byte_size, "Got dimensions %#x, expected %#x at %u.\n",
+                        feedback[j].dimensions, view_byte_size, j);
+                ok(feedback[j].load1 == exp_lo, "Got load<uint16_t> %#x, expected %#x at %u.\n",
+                        feedback[j].load1, exp_lo, j);
+                ok(feedback[j].load2_x == exp_lo, "Got load<uint16_t2>.x %#x, expected %#x at %u.\n",
+                        feedback[j].load2_x, exp_lo, j);
+                ok(feedback[j].load2_y == exp_hi, "Got load<uint16_t2>.y %#x, expected %#x at %u.\n",
+                        feedback[j].load2_y, exp_hi, j);
+                ok(feedback[j].load3_x == exp_lo, "Got load<uint16_t3>.x %#x, expected %#x at %u.\n",
+                        feedback[j].load3_x, exp_lo, j);
+                ok(feedback[j].load3_y == exp_hi, "Got load<uint16_t3>.y %#x, expected %#x at %u.\n",
+                        feedback[j].load3_y, exp_hi, j);
+                ok(feedback[j].load3_z == exp_lo, "Got load<uint16_t3>.z %#x, expected %#x at %u.\n",
+                        feedback[j].load3_z, exp_lo, j);
+                ok(feedback[j].load4_x == exp_lo, "Got load<uint16_t4>.x %#x, expected %#x at %u.\n",
+                        feedback[j].load4_x, exp_lo, j);
+                ok(feedback[j].load4_y == exp_hi, "Got load<uint16_t4>.y %#x, expected %#x at %u.\n",
+                        feedback[j].load4_y, exp_hi, j);
+                ok(feedback[j].load4_z == exp_lo, "Got load<uint16_t4>.z %#x, expected %#x at %u.\n",
+                        feedback[j].load4_z, exp_lo, j);
+                ok(feedback[j].load4_w == exp_hi, "Got load<uint16_t4>.w %#x, expected %#x at %u.\n",
+                        feedback[j].load4_w, exp_hi, j);
+            }
+
+            release_resource_readback(&rb);
+            reset_command_list(context.list, context.allocator);
+        }
+        else if (i == 0)
+        {
+            skip("16-bit shader ops not supported, skipping 16-bit ByteAddressBuffer tests.\n");
+        }
+
+        transition_resource_state(context.list, feedback_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    vkd3d_test_set_context(NULL);
+
+    ID3D12PipelineState_Release(srv_pso);
+    ID3D12PipelineState_Release(uav_pso);
+    ID3D12PipelineState_Release(atomic_pso);
+
+    if (srv_pso_16)
+        ID3D12PipelineState_Release(srv_pso_16);
+    if (uav_pso_16)
+        ID3D12PipelineState_Release(uav_pso_16);
+
+    ID3D12Resource_Release(feedback_buffer);
+    ID3D12Resource_Release(data_buffer);
+
+    ID3D12DescriptorHeap_Release(descriptor_heap);
+    ID3D12DescriptorHeap_Release(descriptor_cpu_heap);
+
+    ID3D12GraphicsCommandList2_Release(command_list2);
+
+    destroy_test_context(&context);
+}
+
 void test_large_heap(void)
 {
 #define SECTION_SIZE    (1ull << 30)
