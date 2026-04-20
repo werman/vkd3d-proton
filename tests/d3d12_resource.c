@@ -5129,11 +5129,11 @@ void test_large_byte_address_buffer(void)
     descriptor_heap = create_gpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4);
     descriptor_cpu_heap = create_cpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
 
-    /* Feedback UAV (structured buffer, slot 2) */
+    /* Feedback UAV (typed texel buffer, slot 2) */
     memset(&uav_desc, 0, sizeof(uav_desc));
     uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    uav_desc.Buffer.StructureByteStride = sizeof(*feedback);
-    uav_desc.Buffer.NumElements = 3;
+    uav_desc.Format = DXGI_FORMAT_R32_UINT;
+    uav_desc.Buffer.NumElements = (sizeof(*feedback) * 3) / sizeof(uint32_t);
 
     ID3D12Device_CreateUnorderedAccessView(context.device, feedback_buffer, NULL,
             &uav_desc, get_cpu_descriptor_handle(&context, descriptor_heap, 2));
@@ -5241,7 +5241,7 @@ void test_large_byte_address_buffer(void)
 
         shader_args.byte_offset = test_byte_offset;
         shader_args.data = tests[i].test_data;
-        shader_args.feedback_offset = 0;
+        shader_args.feedback_offset = 0 * (sizeof(*feedback) / sizeof(uint32_t));
 
         /* SRV load */
         transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -5256,7 +5256,7 @@ void test_large_byte_address_buffer(void)
         /* UAV load + store */
         transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-        shader_args.feedback_offset = 1;
+        shader_args.feedback_offset = 1 * (sizeof(*feedback) / sizeof(uint32_t));
 
         ID3D12GraphicsCommandList_SetPipelineState(context.list, uav_pso);
         ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
@@ -5265,7 +5265,7 @@ void test_large_byte_address_buffer(void)
         /* SRV load after store */
         transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-        shader_args.feedback_offset = 2;
+        shader_args.feedback_offset = 2 * (sizeof(*feedback) / sizeof(uint32_t));
 
         ID3D12GraphicsCommandList_SetPipelineState(context.list, srv_pso);
         ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
@@ -5332,7 +5332,7 @@ void test_large_byte_address_buffer(void)
 
         shader_args.byte_offset = test_byte_offset;
         shader_args.data = tests[i].test_data;
-        shader_args.feedback_offset = 0;
+        shader_args.feedback_offset = 0 * (sizeof(*feedback) / sizeof(uint32_t));
 
         ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, 1, &descriptor_heap);
         ID3D12GraphicsCommandList_SetComputeRootSignature(context.list, context.root_signature);
@@ -5382,7 +5382,7 @@ void test_large_byte_address_buffer(void)
 
             shader_args.byte_offset = test_byte_offset;
             shader_args.data = test_data_16;
-            shader_args.feedback_offset = 0;
+            shader_args.feedback_offset = 0 * (sizeof(*feedback) / sizeof(uint32_t));
 
             /* SRV 16-bit load */
             transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -5397,7 +5397,7 @@ void test_large_byte_address_buffer(void)
             /* UAV 16-bit load + store */
             transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-            shader_args.feedback_offset = 1;
+            shader_args.feedback_offset = 1 * (sizeof(*feedback) / sizeof(uint32_t));
 
             ID3D12GraphicsCommandList_SetPipelineState(context.list, uav_pso_16);
             ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
@@ -5406,7 +5406,7 @@ void test_large_byte_address_buffer(void)
             /* SRV 16-bit load after store */
             transition_resource_state(context.list, data_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-            shader_args.feedback_offset = 2;
+            shader_args.feedback_offset = 2 * (sizeof(*feedback) / sizeof(uint32_t));
 
             ID3D12GraphicsCommandList_SetPipelineState(context.list, srv_pso_16);
             ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);

@@ -15,7 +15,7 @@ struct Feedback
 
 RWByteAddressBuffer uav : register(u0);
 
-RWStructuredBuffer<Feedback> feedback : register(u1);
+RWBuffer<uint> feedback : register(u1);
 
 cbuffer Args : register(b0)
 {
@@ -48,5 +48,15 @@ void main()
 
     uav.Store4(byte_offset, v4 + uint4(1, 1, 1, 1));
 
-    feedback[feedback_offset] = fb;
+    feedback[feedback_offset +  0] = fb.size;
+    feedback[feedback_offset +  1] = fb.load1;
+    feedback[feedback_offset +  2] = fb.load2_x;
+    feedback[feedback_offset +  3] = fb.load2_y;
+    feedback[feedback_offset +  4] = fb.load3_x;
+    feedback[feedback_offset +  5] = fb.load3_y;
+    feedback[feedback_offset +  6] = fb.load3_z;
+    feedback[feedback_offset +  7] = fb.load4_x;
+    feedback[feedback_offset +  8] = fb.load4_y;
+    feedback[feedback_offset +  9] = fb.load4_z;
+    feedback[feedback_offset + 10] = fb.load4_w;
 }
