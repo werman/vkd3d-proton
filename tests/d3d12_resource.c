@@ -5019,8 +5019,10 @@ void test_large_byte_address_buffer(void)
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
     D3D12_FEATURE_DATA_SHADER_MODEL shader_model;
     D3D12_FEATURE_DATA_D3D12_OPTIONS4 options4;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1;
     ID3D12PipelineState *srv_pso, *uav_pso, *atomic_pso;
     ID3D12PipelineState *srv_pso_16, *uav_pso_16;
+    ID3D12PipelineState *atomic_pso_64;
     D3D12_DESCRIPTOR_RANGE rs_desc_ranges[2];
     D3D12_HEAP_PROPERTIES heap_properties;
     D3D12_ROOT_SIGNATURE_DESC rs_desc;
@@ -5029,6 +5031,7 @@ void test_large_byte_address_buffer(void)
     struct resource_readback rb;
     struct test_context context;
     bool supports_16bit;
+    bool supports_int64;
     UINT clear_color[4];
     unsigned int i, j;
     HRESULT hr;
@@ -5036,6 +5039,7 @@ void test_large_byte_address_buffer(void)
 #include "shaders/resource/headers/cs_large_bab_load.h"
 #include "shaders/resource/headers/cs_large_bab_store.h"
 #include "shaders/resource/headers/cs_large_bab_atomics.h"
+#include "shaders/resource/headers/cs_large_bab_atomics_64.h"
 #include "shaders/resource/headers/cs_large_bab_load_16.h"
 #include "shaders/resource/headers/cs_large_bab_store_16.h"
 
@@ -5095,6 +5099,16 @@ void test_large_byte_address_buffer(void)
         hr = E_FAIL;
 
     supports_16bit = SUCCEEDED(hr) && options4.Native16BitShaderOpsSupported;
+
+    shader_model.HighestShaderModel = D3D_SHADER_MODEL_6_6;
+    memset(&options1, 0, sizeof(options1));
+    hr = ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_SHADER_MODEL, &shader_model, sizeof(shader_model));
+    if (SUCCEEDED(hr) && shader_model.HighestShaderModel >= D3D_SHADER_MODEL_6_6)
+        hr = ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1));
+    else
+        hr = E_FAIL;
+
+    supports_int64 = SUCCEEDED(hr) && options1.Int64ShaderOps;
 
     memset(&heap_properties, 0, sizeof(heap_properties));
     heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -5179,6 +5193,11 @@ void test_large_byte_address_buffer(void)
         srv_pso_16 = NULL;
         uav_pso_16 = NULL;
     }
+
+    if (supports_int64)
+        atomic_pso_64 = create_compute_pipeline_state(context.device, context.root_signature, cs_large_bab_atomics_64_dxil);
+    else
+        atomic_pso_64 = NULL;
 
     for (i = 0; i < ARRAY_SIZE(tests); i++)
     {
@@ -5358,6 +5377,60 @@ void test_large_byte_address_buffer(void)
         release_resource_readback(&rb);
         reset_command_list(context.list, context.allocator);
 
+        /* === 64-bit Atomics === */
+        if (supports_int64)
+        {
+            /* Shader seeds the location with ((u64)test_data << 32) | 0xfffffffe and adds
+             * ((u64)1 << 32) | 3. The low half wraps to 1 and carries into the high half,
+             * yielding (test_data + 2) in the high half. */
+            const uint64_t seed_val = ((uint64_t)tests[i].test_data << 32) | 0xfffffffeull;
+            const uint64_t add_val = ((uint64_t)1u << 32) | 3ull;
+            const uint64_t expected_orig = seed_val;
+            const uint64_t expected_new = seed_val + add_val;
+
+            transition_resource_state(context.list, feedback_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            shader_args.byte_offset = test_byte_offset;
+            shader_args.data = tests[i].test_data;
+            shader_args.feedback_offset = 0 * (sizeof(*feedback) / sizeof(uint32_t));
+
+            ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, 1, &descriptor_heap);
+            ID3D12GraphicsCommandList_SetComputeRootSignature(context.list, context.root_signature);
+            ID3D12GraphicsCommandList_SetPipelineState(context.list, atomic_pso_64);
+            ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(context.list, 0, get_gpu_descriptor_handle(&context, descriptor_heap, 0));
+            ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(context.list, 1, sizeof(shader_args) / sizeof(uint32_t), &shader_args, 0);
+            ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+
+            transition_resource_state(context.list, feedback_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+            get_buffer_readback_with_command_list(feedback_buffer, DXGI_FORMAT_UNKNOWN, &rb, context.queue, context.list);
+
+            feedback = rb.data;
+
+            todo_if(is_large)
+            ok(feedback[0].dimensions == view_byte_size, "Got dimensions %#x, expected %#x.\n",
+                    feedback[0].dimensions, view_byte_size);
+            ok(feedback[0].load1 == (uint32_t)expected_orig,
+                    "Got InterlockedAdd64 original.lo %#x, expected %#x.\n",
+                    feedback[0].load1, (uint32_t)expected_orig);
+            ok(feedback[0].load2_x == (uint32_t)(expected_orig >> 32),
+                    "Got InterlockedAdd64 original.hi %#x, expected %#x.\n",
+                    feedback[0].load2_x, (uint32_t)(expected_orig >> 32));
+            ok(feedback[0].load2_y == (uint32_t)expected_new,
+                    "Got value after InterlockedAdd64.lo %#x, expected %#x.\n",
+                    feedback[0].load2_y, (uint32_t)expected_new);
+            ok(feedback[0].load3_x == (uint32_t)(expected_new >> 32),
+                    "Got value after InterlockedAdd64.hi %#x, expected %#x.\n",
+                    feedback[0].load3_x, (uint32_t)(expected_new >> 32));
+
+            release_resource_readback(&rb);
+            reset_command_list(context.list, context.allocator);
+        }
+        else if (i == 0)
+        {
+            skip("64-bit shader ops not supported, skipping 64-bit atomic ByteAddressBuffer tests.\n");
+        }
+
         /* === 16-bit Load/Store === */
         if (supports_16bit)
         {
@@ -5477,6 +5550,8 @@ void test_large_byte_address_buffer(void)
         ID3D12PipelineState_Release(srv_pso_16);
     if (uav_pso_16)
         ID3D12PipelineState_Release(uav_pso_16);
+    if (atomic_pso_64)
+        ID3D12PipelineState_Release(atomic_pso_64);
 
     ID3D12Resource_Release(feedback_buffer);
     ID3D12Resource_Release(data_buffer);
