@@ -27,3 +27,9 @@ executable('triangle', 'triangle.c',
   include_directories : vkd3d_public_includes,
   install             : true,
   gui_app             : true)
+
+executable('bda-paths', 'bda_paths.c',
+  dependencies        : demo_vkd3d_deps,
+  include_directories : vkd3d_public_includes,
+  install             : true,
+  gui_app             : true)
